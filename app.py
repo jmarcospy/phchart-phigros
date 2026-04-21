@@ -1,25 +1,21 @@
 """
-PhCharts — servidor Flask com Supabase (storage permanente)
-  Variáveis de ambiente necessárias:
-    SUPABASE_URL   → ex: https://xyzxyz.supabase.co
-    SUPABASE_KEY   → chave "service_role" (não a anon!)
+PhCharts — servidor Flask com Supabase + Auth
 """
-
 import os, json, zipfile, shutil, tempfile, uuid, time
 from flask import Flask, request, jsonify, send_from_directory, redirect, abort
 from supabase import create_client, Client
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 
-# ── Supabase ──────────────────────────────────────────────────────────
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-sb: Client   = create_client(SUPABASE_URL, SUPABASE_KEY)
+SUPABASE_URL  = os.environ["SUPABASE_URL"]
+SUPABASE_KEY  = os.environ["SUPABASE_KEY"]   # service_role
+SUPABASE_ANON = os.environ.get("SUPABASE_ANON", "")
+sb: Client    = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-BUCKET_CHARTS = "charts"   # bucket para .phchart
-BUCKET_COVERS = "covers"   # bucket para capas
+BUCKET_CHARTS = "charts"
+BUCKET_COVERS = "covers"
 
-# ── helpers de dificuldade ────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────
 def diff_label(n):
     try: n = float(n)
     except: return "?"
@@ -36,21 +32,14 @@ def diff_color(n):
     if n <= 16:  return "hard"
     return "extreme"
 
-# ── banco de dados: Supabase (tabela "charts") ────────────────────────
-def load_db():
-    res = sb.table("charts").select("*").execute()
-    return res.data or []
+def public_url(bucket, filename):
+    if not filename: return None
+    return sb.storage.from_(bucket).get_public_url(filename)
 
 def find_chart(cid):
     res = sb.table("charts").select("*").eq("id", cid).execute()
     return res.data[0] if res.data else None
 
-def public_url(bucket, filename):
-    if not filename:
-        return None
-    return sb.storage.from_(bucket).get_public_url(filename)
-
-# ── extrair metadados do .phchart ─────────────────────────────────────
 def extract_meta(phchart_path):
     meta = {}
     tmp = tempfile.mkdtemp(prefix="ph_")
@@ -63,7 +52,6 @@ def extract_meta(phchart_path):
         meta["columns"]    = data.get("columns", 4)
         meta["note_count"] = len(data.get("notes", []))
         meta["difficulty"] = str(data.get("difficulty", "")).strip()
-        # capa embutida no zip?
         cover_arc = data.get("cover_arc")
         if cover_arc:
             src = os.path.join(tmp, cover_arc)
@@ -73,8 +61,7 @@ def extract_meta(phchart_path):
                 with open(src, "rb") as cf:
                     sb.storage.from_(BUCKET_COVERS).upload(
                         cover_name, cf.read(),
-                        {"content-type": "image/jpeg", "upsert": "true"}
-                    )
+                        {"content-type": "image/jpeg", "upsert": "true"})
                 meta["_embedded_cover"] = cover_name
     except Exception as e:
         print(f"extract_meta error: {e}")
@@ -82,27 +69,40 @@ def extract_meta(phchart_path):
         shutil.rmtree(tmp, ignore_errors=True)
     return meta
 
-# ══════════════════════════════════════════════════════════════════════
-#  ROTAS
-# ══════════════════════════════════════════════════════════════════════
+def get_user_from_token(req):
+    """Valida o Bearer token do Supabase e retorna o user dict ou None."""
+    auth = req.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "): return None
+    token = auth.split(" ", 1)[1]
+    try:
+        res = sb.auth.get_user(token)
+        return res.user
+    except:
+        return None
+
+# ── rotas ─────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
     return send_from_directory("static", "index.html")
 
-# ── listar charts ─────────────────────────────────────────────────────
+@app.route("/api/config")
+def api_config():
+    return jsonify({"anon_key": SUPABASE_ANON})
+
 @app.route("/api/charts")
 def api_charts():
-    db    = load_db()
+    res   = sb.table("charts").select("*").execute()
+    db    = res.data or []
     sort  = request.args.get("sort", "recent")
     diff  = request.args.get("diff", "")
     query = request.args.get("q", "").lower()
 
     if diff:
-        db = [c for c in db if diff_color(c.get("difficulty", "")) == diff]
+        db = [c for c in db if diff_color(c.get("difficulty","")) == diff]
     if query:
-        db = [c for c in db if query in c.get("chart_name", "").lower()
-              or query in c.get("author", "").lower()]
+        db = [c for c in db if query in c.get("chart_name","").lower()
+              or query in c.get("author","").lower()]
 
     if sort == "rating":
         db = sorted(db, key=lambda c: c.get("rating_avg", 0), reverse=True)
@@ -127,14 +127,17 @@ def api_charts():
             "rating_count": c.get("rating_count", 0),
             "cover":        public_url(BUCKET_COVERS, c.get("cover")),
             "uploaded_at":  c.get("uploaded_at", 0),
+            "user_id":      c.get("user_id", ""),
+            "user_email":   c.get("user_email", ""),
         })
     return jsonify(out)
 
-# ── upload ────────────────────────────────────────────────────────────
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
     file       = request.files.get("phchart")
     author     = request.form.get("author", "anônimo").strip()[:40]
+    user_id    = request.form.get("user_id", "")
+    user_email = request.form.get("user_email", "")
     cover_file = request.files.get("cover")
 
     if not file:
@@ -144,32 +147,25 @@ def api_upload():
 
     cid      = str(uuid.uuid4())[:8]
     filename = cid + ".phchart"
-
-    # salva temporariamente para extrair metadados
     tmp_path = os.path.join(tempfile.gettempdir(), filename)
     file.save(tmp_path)
 
-    # faz upload do .phchart para o Supabase Storage
     with open(tmp_path, "rb") as f:
         sb.storage.from_(BUCKET_CHARTS).upload(
             filename, f.read(),
-            {"content-type": "application/octet-stream", "upsert": "true"}
-        )
+            {"content-type": "application/octet-stream", "upsert": "true"})
 
     meta = extract_meta(tmp_path)
     os.remove(tmp_path)
-
     cover_name = meta.pop("_embedded_cover", None)
 
-    # capa enviada manualmente sobrepõe a embutida
     if cover_file and cover_file.filename:
         ext = os.path.splitext(cover_file.filename)[1].lower()
         if ext in (".png", ".jpg", ".jpeg", ".webp"):
             cover_name = cid + ext
             sb.storage.from_(BUCKET_COVERS).upload(
                 cover_name, cover_file.read(),
-                {"content-type": "image/" + ext.lstrip("."), "upsert": "true"}
-            )
+                {"content-type": "image/" + ext.lstrip("."), "upsert": "true"})
 
     sb.table("charts").insert({
         "id":           cid,
@@ -185,55 +181,94 @@ def api_upload():
         "rating_avg":   0,
         "rating_count": 0,
         "uploaded_at":  int(time.time()),
+        "user_id":      user_id,
+        "user_email":   user_email,
     }).execute()
 
     return jsonify({"ok": True, "id": cid})
 
-# ── download ──────────────────────────────────────────────────────────
+@app.route("/api/edit/<cid>", methods=["POST"])
+def api_edit(cid):
+    user = get_user_from_token(request)
+    if not user:
+        return jsonify({"error": "Não autorizado"}), 401
+
+    chart = find_chart(cid)
+    if not chart:
+        return jsonify({"error": "Chart não encontrado"}), 404
+
+    # só o dono pode editar
+    if chart.get("user_id") != user.id and chart.get("user_email") != user.email:
+        return jsonify({"error": "Sem permissão"}), 403
+
+    updates = {}
+    if request.form.get("chart_name"):
+        updates["chart_name"] = request.form["chart_name"].strip()[:80]
+    if request.form.get("difficulty"):
+        updates["difficulty"] = request.form["difficulty"].strip()
+
+    cover_file = request.files.get("cover")
+    if cover_file and cover_file.filename:
+        ext = os.path.splitext(cover_file.filename)[1].lower()
+        if ext in (".png", ".jpg", ".jpeg", ".webp"):
+            cover_name = cid + "_edit" + ext
+            sb.storage.from_(BUCKET_COVERS).upload(
+                cover_name, cover_file.read(),
+                {"content-type": "image/" + ext.lstrip("."), "upsert": "true"})
+            updates["cover"] = cover_name
+
+    if updates:
+        sb.table("charts").update(updates).eq("id", cid).execute()
+
+    return jsonify({"ok": True})
+
+@app.route("/api/delete/<cid>", methods=["DELETE"])
+def api_delete(cid):
+    user = get_user_from_token(request)
+    if not user:
+        return jsonify({"error": "Não autorizado"}), 401
+
+    chart = find_chart(cid)
+    if not chart:
+        return jsonify({"error": "Chart não encontrado"}), 404
+
+    if chart.get("user_id") != user.id and chart.get("user_email") != user.email:
+        return jsonify({"error": "Sem permissão"}), 403
+
+    # remove arquivos do storage
+    try: sb.storage.from_(BUCKET_CHARTS).remove([chart["filename"]])
+    except: pass
+    if chart.get("cover"):
+        try: sb.storage.from_(BUCKET_COVERS).remove([chart["cover"]])
+        except: pass
+
+    sb.table("charts").delete().eq("id", cid).execute()
+    return jsonify({"ok": True})
+
 @app.route("/api/download/<cid>")
 def api_download(cid):
     chart = find_chart(cid)
-    if not chart:
-        abort(404)
-
-    # incrementa contador
-    sb.table("charts").update(
-        {"downloads": chart.get("downloads", 0) + 1}
-    ).eq("id", cid).execute()
-
-    # redireciona para URL pública do Supabase Storage
+    if not chart: abort(404)
+    sb.table("charts").update({"downloads": chart.get("downloads", 0) + 1}).eq("id", cid).execute()
     url = sb.storage.from_(BUCKET_CHARTS).get_public_url(chart["filename"])
     return redirect(url)
 
-# ── rating ────────────────────────────────────────────────────────────
 @app.route("/api/rate/<cid>", methods=["POST"])
 def api_rate(cid):
     body  = request.get_json(silent=True) or {}
     stars = int(body.get("stars", 0))
     if stars < 1 or stars > 5:
         return jsonify({"error": "estrelas entre 1 e 5"}), 400
-
     ip    = request.remote_addr
     chart = find_chart(cid)
-    if not chart:
-        abort(404)
-
+    if not chart: abort(404)
     ratings = chart.get("ratings") or []
-    if isinstance(ratings, str):
-        ratings = json.loads(ratings)
-
+    if isinstance(ratings, str): ratings = json.loads(ratings)
     ratings = [r for r in ratings if r.get("ip") != ip]
     ratings.append({"ip": ip, "stars": stars})
-
     avg   = round(sum(r["stars"] for r in ratings) / len(ratings), 2)
     count = len(ratings)
-
-    sb.table("charts").update({
-        "ratings":      ratings,
-        "rating_avg":   avg,
-        "rating_count": count,
-    }).eq("id", cid).execute()
-
+    sb.table("charts").update({"ratings": ratings, "rating_avg": avg, "rating_count": count}).eq("id", cid).execute()
     return jsonify({"ok": True, "avg": avg, "count": count})
 
 if __name__ == "__main__":
